@@ -1,0 +1,874 @@
+//@version=6
+// MONSSIF QUANT EDGE — integrated build. Base engine: smart-money-concepts.pine
+// (see docs/MONSSIF_QUANT_EDGE_RESEARCH.md for audit, licensing notes and
+// limitations). Confirmation modules below are original code using only
+// built-in ta.* functions — no third-party source was copied.
+// STRATEGY VERSION: same engine + simulated entries/exits (see docs/QA_AND_BACKTEST.md). Backtests are hypothetical, not indicative of future results.
+// v2.0 Professional upgrade: setup state machine, frozen risk levels,
+// expanded Signal Analysis Panel, dynamic alerts. Analysis / paper-trading
+// only — no live execution. This indicator is a technical-analysis aid.
+// It does not guarantee profitable trades; the quality score is a heuristic
+// confluence count, NOT a win probability. Backtest + paper-trade first.
+strategy("MONSSIF QUANT EDGE v2 — Strategy (Backtest/Simulation)", "MQE Strat", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500, initial_capital = 10000, pyramiding = 0, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 2, process_orders_on_close = true)
+
+// ════════════════════════════════════════════════════════════════
+//  Concept credits: smart money terminology (order blocks, fair
+//  value gaps, liquidity sweeps, premium and discount) popularized
+//  by the Inner Circle Trader methodology (Michael J. Huddleston),
+//  with roots in the market logic of Richard D. Wyckoff.
+//  The confluence scoring model, narrative engine, zone life cycle
+//  system and all code in this script are original work.
+// ════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════
+//  INPUTS
+// ════════════════════════════════════════════════════════════════
+grpS = "Market Structure"
+sLen       = input.int(15, "Swing Structure Length", minval = 5, maxval = 60, group = grpS)
+iLen       = input.int(5, "Internal Structure Length", minval = 2, maxval = 20, group = grpS)
+showSwing  = input.bool(true, "Show Swing Events", group = grpS)
+showInt    = input.bool(true, "Show Internal Events", group = grpS)
+keepStruct = input.int(8, "Structure Events To Keep", minval = 2, maxval = 30, group = grpS, tooltip = "Older structure lines and labels beyond this count are deleted so the chart stays clean and the auto-scale stays anchored to current price.")
+
+grpO = "Order Blocks"
+showOB     = input.bool(true, "Show Order Blocks", group = grpO)
+obLookback = input.int(30, "Origin Candle Lookback", minval = 5, maxval = 100, group = grpO)
+keepOB     = input.int(6, "Order Blocks To Keep", minval = 2, maxval = 20, group = grpO)
+
+grpG = "Fair Value Gaps"
+showFvg   = input.bool(false, "Show Fair Value Gaps", group = grpG)
+showInv   = input.bool(true, "Track Inversions", group = grpG)
+fvgMinAtr = input.float(0.15, "Minimum Gap Size (Average True Range Ratio)", step = 0.05, minval = 0.0, group = grpG)
+keepFvg   = input.int(8, "Fair Value Gaps To Keep", minval = 2, maxval = 30, group = grpG)
+
+grpL = "Liquidity"
+showLiq  = input.bool(true, "Show Equal Highs / Equal Lows", group = grpL)
+eqTol    = input.float(0.25, "Equal Level Tolerance (Average True Range Ratio)", step = 0.05, minval = 0.05, group = grpL)
+keepLiq  = input.int(6, "Liquidity Levels To Keep", minval = 2, maxval = 20, group = grpL)
+
+grpPD = "Premium & Discount"
+showPd = input.bool(true, "Show Premium / Discount Map", group = grpPD)
+pdExt  = input.int(12, "Map Extension (Bars)", minval = 4, maxval = 60, group = grpPD)
+
+grpX = "Signals"
+showSigs = input.bool(true, "Show Zone Tap Signals", group = grpX)
+keepSigs = input.int(6, "Signals To Keep", minval = 2, maxval = 20, group = grpX)
+
+grpV = "Chart Visuals"
+bullCol = input.color(#00a89d, "Bullish Color", group = grpV)
+bearCol = input.color(#e8365f, "Bearish Color", group = grpV)
+goldCol = input.color(#d99b1e, "Accent Color", group = grpV)
+silvCol = input.color(#5c6b80, "Neutral Color", group = grpV)
+
+grpT = "Dashboard"
+showDash    = input.bool(true, "Show Dashboard", group = grpT)
+showNarr    = input.bool(true, "Show Narrative Row", group = grpT)
+dashPos     = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = grpT)
+dashSize    = input.string("Small", "Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = grpT)
+dashTitleBg = input.color(color.new(#231a08, 0), "Title Band", group = grpT)
+dashBg      = input.color(color.new(#171207, 8), "Background", group = grpT)
+dashFrame   = input.color(color.new(#d99b1e, 15), "Frame", group = grpT)
+dashGrid    = input.color(color.new(#d99b1e, 80), "Grid", group = grpT)
+dashHeadTxt = input.color(color.new(#f0c05a, 0), "Header Text", group = grpT)
+dashBodyTxt = input.color(color.new(#eef2f7, 5), "Body Text", group = grpT)
+dashMuteTxt = input.color(color.new(#cdb87e, 15), "Muted Text", group = grpT)
+
+grpW = "VWAP & Bands"
+showVwap = input.bool(false, "Show Session VWAP + ±1/±2σ Bands", group = grpW, tooltip = "Anchored to the daily session via ta.vwap (hlc3). Hidden by default to keep the chart clean. On volume-less symbols TradingView falls back to equal weighting.")
+vwapSrc  = input.source(hlc3, "VWAP Source", group = grpW)
+
+grpTM = "Trend & Momentum"
+showEma  = input.bool(false, "Show EMA 50 / 200", group = grpTM)
+emaFastL = input.int(50, "EMA Fast Length", minval = 5, group = grpTM)
+emaSlowL = input.int(200, "EMA Slow Length", minval = 20, group = grpTM)
+adxLen   = input.int(14, "ADX / DMI Length", minval = 5, group = grpTM)
+adxTrend = input.float(25.0, "ADX Trend Threshold", step = 1.0, group = grpTM)
+rsiLen   = input.int(14, "RSI Length", minval = 5, group = grpTM)
+
+grpRG = "Volatility Regime & Relative Volume"
+rvolMin  = input.float(1.0, "Minimum RVOL for Quality Signals", step = 0.1, minval = 0.0, group = grpRG, tooltip = "RVOL = volume / 20-bar SMA of volume. 1.0 = average.")
+useRvolF = input.bool(false, "Require RVOL Filter on Zone Taps", group = grpRG)
+
+grpMTF = "Multi-Timeframe Confirmation"
+showMtf  = input.bool(true, "Show HTF Trend in Dashboard", group = grpMTF)
+htfTf    = input.timeframe("240", "Higher Timeframe", group = grpMTF)
+useMtfF  = input.bool(false, "Require HTF Alignment on Zone Taps", group = grpMTF, tooltip = "Uses the last CLOSED HTF bar ([1], lookahead off) — non-repainting by construction.")
+
+grpRK = "Risk Levels"
+showRisk = input.bool(true, "Draw SL / TP1 / TP2 on Zone Taps", group = grpRK)
+tp1R     = input.float(1.5, "TP1 (R multiple)", step = 0.25, group = grpRK)
+tp2R     = input.float(2.5, "TP2 (R multiple)", step = 0.25, group = grpRK)
+keepRisk = input.int(4, "Risk Level Sets To Keep", minval = 1, maxval = 10, group = grpRK)
+
+grpSM = "Setup State Machine"
+setupExpiry = input.int(100, "Setup Expiry (bars)", minval = 10, maxval = 500, group = grpSM, tooltip = "Active setup expires after this many bars if neither TP2 nor invalidation occurs.")
+maxRiskAtr  = input.float(3.0, "Max Risk (×ATR, 0 = no cap)", step = 0.5, minval = 0.0, group = grpSM, tooltip = "Setups whose entry→SL distance exceeds this multiple of ATR are rejected (validation).")
+atrBuffer   = input.float(0.25, "SL Buffer Beyond Zone (×ATR)", step = 0.05, minval = 0.0, group = grpSM)
+showSetupLbl= input.bool(true, "Show Setup Labels (Entry/SL/TP)", group = grpSM)
+
+grpST = "Strategy Testing (strategy version only)"
+stLong  = input.bool(true, "Allow Simulated Longs", group = grpST)
+stShort = input.bool(true, "Allow Simulated Shorts", group = grpST)
+stRiskPct = input.float(0.5, "Risk per Simulated Trade (% equity)", step = 0.25, minval = 0.05, maxval = 5.0, group = grpST)
+stTp1Qty  = input.int(50, "TP1 Exit % of Position", minval = 0, maxval = 100, group = grpST)
+
+grpQF = "Signal Quality Filters"
+useAdxF  = input.bool(false, "Require ADX Trend Filter on Zone Taps", group = grpQF)
+useVwapF = input.bool(false, "Require VWAP Location on Zone Taps", group = grpQF, tooltip = "Bull taps only above session VWAP, bear taps only below.")
+
+// ════════════════════════════════════════════════════════════════
+//  SHARED SERIES + HELPERS
+// ════════════════════════════════════════════════════════════════
+atr    = ta.atr(14)
+volSma = ta.sma(volume, 20)
+
+f_rep(string s, int n) =>
+    out = ""
+    if n > 0
+        for i = 1 to n
+            out += s
+    out
+
+// ════════════════════════════════════════════════════════════════
+//  STATE
+// ════════════════════════════════════════════════════════════════
+// swing structure
+var float swingHigh = na
+var int   swingHighBar = na
+var bool  swingHighBroken = false
+var float swingLow = na
+var int   swingLowBar = na
+var bool  swingLowBroken = false
+var int   sDir = 0
+// internal structure
+var float intHigh = na
+var bool  intHighBroken = false
+var float intLow = na
+var bool  intLowBroken = false
+var int   iDir = 0
+// liquidity sweep memory
+var int lastBuySweepBar  = -10000
+var int lastSellSweepBar = -10000
+var bool swingHighSwept  = false
+var bool swingLowSwept   = false
+var int  lastSweepLabBar = -10000
+var string lastEvent = "—"
+var string liqStatus = "Resting"
+
+// drawing memory
+var array<line>  stLines  = array.new<line>()
+var array<label> stLabels = array.new<label>()
+var array<label> inLabels = array.new<label>()
+var array<box>   obBoxes  = array.new<box>()
+var array<int>   obDir    = array.new<int>()
+var array<int>   obState  = array.new<int>()   // 0 fresh · 1 tested · 2 mitigated
+var array<box>   fvgBoxes = array.new<box>()
+var array<int>   fvgDir   = array.new<int>()
+var array<int>   fvgState = array.new<int>()   // 0 fresh · 1 inverted · 2 dead
+var array<line>  lqLines  = array.new<line>()
+var array<label> lqLabels = array.new<label>()
+var array<float> lqPrice  = array.new<float>()
+var array<int>   lqDir    = array.new<int>()
+var array<int>   lqActive = array.new<int>()
+var array<label> sgLabels = array.new<label>()
+var array<line>  rkLines  = array.new<line>()
+var array<label> rkLabels = array.new<label>()
+var array<box>   pdB = array.new<box>()
+var array<line>  pdL = array.new<line>()
+var array<label> pdT = array.new<label>()
+
+// event flags (reset every bar)
+bool evBosBull   = false
+bool evBosBear   = false
+bool evChochBull = false
+bool evChochBear = false
+bool evSweepBuy  = false
+bool evSweepSell = false
+bool evTapBull   = false
+bool evTapBear   = false
+bool evInvFvg    = false
+bool evSetupLong  = false
+bool evSetupShort = false
+bool evInvalid    = false
+bool evLevels     = false
+bool evTp1        = false
+bool evComplete   = false
+bool evExpired    = false
+
+// ── Setup state machine ──────────────────────────────────────
+// 0 IDLE · 1 ACTIVE (potential, levels frozen) · terminal events
+// INVALIDATED / COMPLETED(TP2) / EXPIRED are one-bar events that
+// return the machine to IDLE. One active setup max: new taps are
+// ignored while ACTIVE, so signals/labels/alerts cannot duplicate.
+var int   suState  = 0
+var int   suDir    = 0          // 1 long · -1 short
+var int   suId     = 0
+var int   suBar    = na
+var float suEntry  = na
+var float suSL     = na         // also the invalidation level
+var float suTP1    = na
+var float suTP2    = na
+var float suRisk   = na
+var bool  suTp1Hit = false
+var string suStatus = "NO SETUP"
+
+// ════════════════════════════════════════════════════════════════
+//  ORDER BLOCK ORIGIN FINDER
+// ════════════════════════════════════════════════════════════════
+f_findOrigin(bool bull_) =>
+    int idx = na
+    for b = 1 to math.min(obLookback, bar_index)
+        if bull_ ? close[b] < open[b] : close[b] > open[b]
+            idx := b
+            break
+    idx
+
+// Called UNCONDITIONALLY every bar (CW10003): the origin scan always
+// runs; a zone is only created when `create_` is true (a confirmed
+// swing BOS/CHoCH fired this bar). Behaviour is unchanged.
+f_makeOB(bool bull_, bool create_) =>
+    idx = f_findOrigin(bull_)
+    if create_ and showOB and not na(idx)
+        obT = high[idx]
+        obB = low[idx]
+        rv  = na(volume[idx]) or na(volSma[idx]) or volSma[idx] == 0 ? na : volume[idx] / volSma[idx]
+        txt = (bull_ ? "Demand" : "Supply") + (na(rv) ? "" : " · " + str.tostring(rv, "#.0") + "× Volume")
+        c   = bull_ ? bullCol : bearCol
+        obBoxes.push(box.new(bar_index - idx, obT, bar_index + 2, obB, border_color = color.new(c, 0), bgcolor = color.new(c, 70), text = txt, text_size = size.small, text_color = color.new(c, 0), text_halign = text.align_right, text_valign = bull_ ? text.align_top : text.align_bottom))
+        obDir.push(bull_ ? 1 : -1)
+        obState.push(0)
+
+// ════════════════════════════════════════════════════════════════
+//  SWING PIVOTS + EQUAL HIGHS / LOWS
+// ════════════════════════════════════════════════════════════════
+sph = ta.pivothigh(high, sLen, sLen)
+spl = ta.pivotlow(low, sLen, sLen)
+iph = ta.pivothigh(high, iLen, iLen)
+ipl = ta.pivotlow(low, iLen, iLen)
+
+if not na(sph)
+    // equal highs = resting buy-side liquidity
+    if showLiq and not na(swingHigh) and math.abs(sph - swingHigh) <= atr * eqTol
+        lvl = math.max(sph, swingHigh)
+        lqLines.push(line.new(swingHighBar, lvl, bar_index - sLen, lvl, color = color.new(bearCol, 5), style = line.style_dotted, width = 2))
+        lqLabels.push(label.new(bar_index - sLen, lvl, "EQH", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(bearCol, 0), size = size.small))
+        lqPrice.push(lvl)
+        lqDir.push(1)
+        lqActive.push(1)
+    swingHigh := sph
+    swingHighBar := bar_index - sLen
+    swingHighBroken := false
+    swingHighSwept := false
+if not na(spl)
+    // equal lows = resting sell-side liquidity
+    if showLiq and not na(swingLow) and math.abs(spl - swingLow) <= atr * eqTol
+        lvl = math.min(spl, swingLow)
+        lqLines.push(line.new(swingLowBar, lvl, bar_index - sLen, lvl, color = color.new(bullCol, 5), style = line.style_dotted, width = 2))
+        lqLabels.push(label.new(bar_index - sLen, lvl, "EQL", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(bullCol, 0), size = size.small))
+        lqPrice.push(lvl)
+        lqDir.push(-1)
+        lqActive.push(1)
+    swingLow := spl
+    swingLowBar := bar_index - sLen
+    swingLowBroken := false
+    swingLowSwept := false
+if not na(iph)
+    intHigh := iph
+    intHighBroken := false
+if not na(ipl)
+    intLow := ipl
+    intLowBroken := false
+
+// ════════════════════════════════════════════════════════════════
+//  STRUCTURE EVENTS (confirmed bars only — non repainting)
+// ════════════════════════════════════════════════════════════════
+if barstate.isconfirmed
+    // swing bullish break
+    if not na(swingHigh) and not swingHighBroken and close > swingHigh
+        isCh = sDir == -1
+        if isCh
+            evChochBull := true
+            lastEvent := "CHoCH ↑"
+        else
+            evBosBull := true
+            lastEvent := "BoS ↑"
+        if showSwing
+            stLines.push(line.new(swingHighBar, swingHigh, bar_index, swingHigh, color = color.new(bullCol, 0), width = 2, style = isCh ? line.style_dashed : line.style_solid))
+            stLabels.push(label.new(int(math.avg(swingHighBar, bar_index)), swingHigh, isCh ? "CHoCH" : "BoS", style = label.style_label_down, color = color.new(color.black, 100), textcolor = color.new(bullCol, 0), size = size.small))
+        sDir := 1
+        swingHighBroken := true
+    // swing bearish break
+    if not na(swingLow) and not swingLowBroken and close < swingLow
+        isCh = sDir == 1
+        if isCh
+            evChochBear := true
+            lastEvent := "CHoCH ↓"
+        else
+            evBosBear := true
+            lastEvent := "BoS ↓"
+        if showSwing
+            stLines.push(line.new(swingLowBar, swingLow, bar_index, swingLow, color = color.new(bearCol, 0), width = 2, style = isCh ? line.style_dashed : line.style_solid))
+            stLabels.push(label.new(int(math.avg(swingLowBar, bar_index)), swingLow, isCh ? "CHoCH" : "BoS", style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.new(bearCol, 0), size = size.small))
+        sDir := -1
+        swingLowBroken := true
+    // internal breaks (context tier)
+    if not na(intHigh) and not intHighBroken and close > intHigh
+        if showInt
+            inLabels.push(label.new(bar_index, intHigh, iDir == -1 ? "choch" : "bos", style = label.style_label_down, color = color.new(color.black, 100), textcolor = color.new(bullCol, 20), size = size.tiny))
+        iDir := 1
+        intHighBroken := true
+    if not na(intLow) and not intLowBroken and close < intLow
+        if showInt
+            inLabels.push(label.new(bar_index, intLow, iDir == 1 ? "choch" : "bos", style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.new(bearCol, 20), size = size.tiny))
+        iDir := -1
+        intLowBroken := true
+    // single swing sweeps (stop hunts without a body break)
+    if not na(swingHigh) and not swingHighBroken and not swingHighSwept and high > swingHigh and close < swingHigh and bar_index - lastSweepLabBar >= 5
+        evSweepBuy := true
+        swingHighSwept := true
+        lastSweepLabBar := bar_index
+        lastBuySweepBar := bar_index
+        liqStatus := "Buy swept"
+        if showLiq
+            sgLabels.push(label.new(bar_index, high, "Liquidity Sweep ✕", style = label.style_label_down, color = color.new(bearCol, 5), textcolor = color.new(#ffffff, 0), size = size.small))
+    if not na(swingLow) and not swingLowBroken and not swingLowSwept and low < swingLow and close > swingLow and bar_index - lastSweepLabBar >= 5
+        evSweepSell := true
+        swingLowSwept := true
+        lastSweepLabBar := bar_index
+        lastSellSweepBar := bar_index
+        liqStatus := "Sell swept"
+        if showLiq
+            sgLabels.push(label.new(bar_index, low, "Liquidity Sweep ✕", style = label.style_label_up, color = color.new(bullCol, 5), textcolor = color.new(#ffffff, 0), size = size.small))
+
+// order-block creation: unconditional call every bar (CW10003).
+// evBos*/evChoch* are only true on confirmed break bars, so zones
+// are created exactly when (and only when) v1 created them.
+f_makeOB(true,  evBosBull or evChochBull)
+f_makeOB(false, evBosBear or evChochBear)
+
+// ════════════════════════════════════════════════════════════════
+//  EQUAL LEVEL LIFE CYCLE
+// ════════════════════════════════════════════════════════════════
+if lqLines.size() > 0
+    for i = 0 to lqLines.size() - 1
+        if lqActive.get(i) == 1
+            ln = lqLines.get(i)
+            lb = lqLabels.get(i)
+            pr = lqPrice.get(i)
+            line.set_x2(ln, bar_index + 2)
+            label.set_x(lb, bar_index + 2)
+            if barstate.isconfirmed
+                if lqDir.get(i) == 1
+                    if high > pr and close < pr
+                        line.set_color(ln, color.new(silvCol, 60))
+                        line.set_style(ln, line.style_dashed)
+                        label.set_text(lb, "EQH Swept ✕")
+                        label.set_textcolor(lb, color.new(silvCol, 35))
+                        lqActive.set(i, 0)
+                        evSweepBuy := true
+                        lastBuySweepBar := bar_index
+                        liqStatus := "Buy swept"
+                    else if close > pr
+                        line.set_color(ln, color.new(silvCol, 70))
+                        label.set_textcolor(lb, color.new(silvCol, 55))
+                        lqActive.set(i, 0)
+                else
+                    if low < pr and close > pr
+                        line.set_color(ln, color.new(silvCol, 60))
+                        line.set_style(ln, line.style_dashed)
+                        label.set_text(lb, "EQL Swept ✕")
+                        label.set_textcolor(lb, color.new(silvCol, 35))
+                        lqActive.set(i, 0)
+                        evSweepSell := true
+                        lastSellSweepBar := bar_index
+                        liqStatus := "Sell swept"
+                    else if close < pr
+                        line.set_color(ln, color.new(silvCol, 70))
+                        label.set_textcolor(lb, color.new(silvCol, 55))
+                        lqActive.set(i, 0)
+
+// ════════════════════════════════════════════════════════════════
+//  FAIR VALUE GAPS + INVERSIONS
+// ════════════════════════════════════════════════════════════════
+rawBullG = low > high[2] and (low - high[2]) >= atr * fvgMinAtr
+rawBearG = high < low[2] and (low[2] - high) >= atr * fvgMinAtr
+if barstate.isconfirmed and (rawBullG or rawBearG)  // logic always tracked; showFvg only controls visibility
+    gT = rawBullG ? low : low[2]
+    gB = rawBullG ? high[2] : high
+    gC = rawBullG ? bullCol : bearCol
+    fvgBoxes.push(box.new(bar_index - 2, gT, bar_index + 2, gB, border_color = color.new(gC, showFvg ? 25 : 100), bgcolor = color.new(gC, showFvg ? 76 : 100), text = showFvg ? "Imbalance" : "", text_size = size.small, text_color = color.new(gC, 5), text_halign = text.align_right))
+    fvgDir.push(rawBullG ? 1 : -1)
+    fvgState.push(0)
+
+if fvgBoxes.size() > 0
+    for i = fvgBoxes.size() - 1 to 0
+        st = fvgState.get(i)
+        fb = fvgBoxes.get(i)
+        fd = fvgDir.get(i)
+        box.set_right(fb, bar_index + 2)
+        bool killed = false
+        if barstate.isconfirmed
+            if st == 0 and fd == 1 and close < box.get_bottom(fb)
+                if showInv
+                    box.set_bgcolor(fb, color.new(bearCol, showFvg ? 76 : 100))
+                    box.set_border_color(fb, color.new(bearCol, showFvg ? 25 : 100))
+                    box.set_text(fb, showFvg ? "Inversion" : "")
+                    box.set_text_color(fb, color.new(bearCol, 5))
+                    fvgDir.set(i, -1)
+                    fvgState.set(i, 1)
+                    evInvFvg := true
+                else
+                    killed := true
+            else if st == 0 and fd == -1 and close > box.get_top(fb)
+                if showInv
+                    box.set_bgcolor(fb, color.new(bullCol, showFvg ? 76 : 100))
+                    box.set_border_color(fb, color.new(bullCol, showFvg ? 25 : 100))
+                    box.set_text(fb, showFvg ? "Inversion" : "")
+                    box.set_text_color(fb, color.new(bullCol, 5))
+                    fvgDir.set(i, 1)
+                    fvgState.set(i, 1)
+                    evInvFvg := true
+                else
+                    killed := true
+            else if st == 1 and fd == -1 and close > box.get_top(fb)
+                killed := true
+            else if st == 1 and fd == 1 and close < box.get_bottom(fb)
+                killed := true
+        if killed
+            box.delete(fb)
+            fvgBoxes.remove(i)
+            fvgDir.remove(i)
+            fvgState.remove(i)
+
+// ════════════════════════════════════════════════════════════════
+//  PREMIUM / DISCOUNT MAP
+// ════════════════════════════════════════════════════════════════
+float pdPos = na
+if not na(swingHigh) and not na(swingLow) and swingHigh > swingLow
+    pdPos := (close - swingLow) / (swingHigh - swingLow)
+
+if barstate.islast
+    while pdB.size() > 0
+        box.delete(pdB.shift())
+    while pdL.size() > 0
+        line.delete(pdL.shift())
+    while pdT.size() > 0
+        label.delete(pdT.shift())
+
+if barstate.islast and showPd and not na(pdPos)
+    eq = math.avg(swingHigh, swingLow)
+    q  = (swingHigh - swingLow) * 0.25
+    x2 = bar_index + pdExt
+    pdB.push(box.new(bar_index, swingHigh, x2, eq, border_color = na, bgcolor = color.new(bearCol, 86)))
+    pdB.push(box.new(bar_index, swingHigh, x2, swingHigh - q, border_color = na, bgcolor = color.new(bearCol, 78)))
+    pdB.push(box.new(bar_index, eq, x2, swingLow, border_color = na, bgcolor = color.new(bullCol, 86)))
+    pdB.push(box.new(bar_index, swingLow + q, x2, swingLow, border_color = na, bgcolor = color.new(bullCol, 78)))
+    pdL.push(line.new(bar_index, eq, x2, eq, color = color.new(silvCol, 15), style = line.style_dashed))
+    pdT.push(label.new(x2, swingHigh, "Premium", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(bearCol, 0), size = size.small))
+    pdT.push(label.new(x2, eq, "Equilibrium", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(silvCol, 0), size = size.small))
+    pdT.push(label.new(x2, swingLow, "Discount", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(bullCol, 0), size = size.small))
+
+// ════════════════════════════════════════════════════════════════
+//  CONFIRMATION MODULES (all native ta.* — no external code reused)
+//  VWAP: session-anchored; ADX/RSI/EMA: trend & momentum;
+//  ATR%: volatility regime; RVOL: volume confirmation; MTF: last
+//  closed HTF bar only, so none of these repaint after bar close.
+// ════════════════════════════════════════════════════════════════
+[vwapLine, vwapU1, vwapL1] = ta.vwap(vwapSrc, timeframe.change("D"), 1)
+[_, vwapU2, vwapL2]        = ta.vwap(vwapSrc, timeframe.change("D"), 2)
+plot(showVwap ? vwapLine : na, "Session VWAP", color.new(goldCol, 10), 2)
+plot(showVwap ? vwapU1 : na, "VWAP +1σ", color.new(goldCol, 55))
+plot(showVwap ? vwapL1 : na, "VWAP -1σ", color.new(goldCol, 55))
+plot(showVwap ? vwapU2 : na, "VWAP +2σ", color.new(goldCol, 75))
+plot(showVwap ? vwapL2 : na, "VWAP -2σ", color.new(goldCol, 75))
+
+emaFast = ta.ema(close, emaFastL)
+emaSlow = ta.ema(close, emaSlowL)
+plot(showEma ? emaFast : na, "EMA Fast", color.new(bullCol, 30))
+plot(showEma ? emaSlow : na, "EMA Slow", color.new(silvCol, 30))
+[_, _, adxVal] = ta.dmi(adxLen, adxLen)
+rsiVal  = ta.rsi(close, rsiLen)
+atrPct  = close > 0 ? atr / close * 100 : na
+atrRank = ta.percentrank(atrPct, 100)
+rvol    = na(volume) or na(volSma) or volSma == 0 ? na : volume / volSma
+string regime = adxVal >= adxTrend ? (atrRank >= 80 ? "Trending · Volatile" : "Trending") : adxVal <= 20 ? (atrRank >= 80 ? "Ranging · Volatile" : "Ranging") : "Transitional"
+bool trendBull = close > emaFast and emaFast > emaSlow
+bool trendBear = close < emaFast and emaFast < emaSlow
+
+f_htfState() =>
+    e = ta.ema(close, emaFastL)
+    close > e and e > e[1] ? 1 : close < e and e < e[1] ? -1 : 0
+htfState = request.security(syminfo.tickerid, htfTf, f_htfState()[1], lookahead = barmerge.lookahead_off)
+htfBull  = htfState == 1
+htfBear  = htfState == -1
+
+// quality-filter verdicts for zone taps (structure direction aware)
+bool filtBullOk = (not useMtfF or htfBull) and (not useRvolF or (not na(rvol) and rvol >= rvolMin)) and (not useAdxF or adxVal >= adxTrend) and (not useVwapF or close > vwapLine)
+bool filtBearOk = (not useMtfF or htfBear) and (not useRvolF or (not na(rvol) and rvol >= rvolMin)) and (not useAdxF or adxVal >= adxTrend) and (not useVwapF or close < vwapLine)
+
+// extended quality score: original 100-pt structure score is kept
+// untouched (variable `score` below); qScore adds confirmation pts.
+int qTrend = 0
+int qMtf   = 0
+int qRvol  = 0
+int qVwap  = 0
+
+// ════════════════════════════════════════════════════════════════
+//  CONFLUENCE SCORE (computed before zone maintenance)
+// ════════════════════════════════════════════════════════════════
+bool demandFreshNear = false
+bool supplyFreshNear = false
+if obBoxes.size() > 0
+    for i = 0 to obBoxes.size() - 1
+        if obState.get(i) != 2
+            if obDir.get(i) == 1 and box.get_top(obBoxes.get(i)) >= close - atr * 4
+                demandFreshNear := true
+            if obDir.get(i) == -1 and box.get_bottom(obBoxes.get(i)) <= close + atr * 4
+                supplyFreshNear := true
+bool bullFvgFresh = false
+bool bearFvgFresh = false
+if fvgBoxes.size() > 0
+    for i = 0 to fvgBoxes.size() - 1
+        if fvgState.get(i) != 2
+            if fvgDir.get(i) == 1
+                bullFvgFresh := true
+            else
+                bearFvgFresh := true
+
+int cStruct = sDir != 0 and not na(pdPos) and sDir == iDir ? 25 : 0
+int cRange  = sDir != 0 and not na(pdPos) and ((sDir == 1 and pdPos < 0.5) or (sDir == -1 and pdPos > 0.5)) ? 25 : 0
+int cZone   = sDir != 0 and not na(pdPos) and (sDir == 1 ? demandFreshNear : supplyFreshNear) ? 20 : 0
+int cFvg    = sDir != 0 and not na(pdPos) and (sDir == 1 ? bullFvgFresh : bearFvgFresh) ? 15 : 0
+int cSweep  = sDir != 0 and not na(pdPos) and (sDir == 1 ? bar_index - lastSellSweepBar <= 30 : bar_index - lastBuySweepBar <= 30) ? 15 : 0
+int score   = cStruct + cRange + cZone + cFvg + cSweep   // core 100 (unchanged weights)
+if sDir != 0 and not na(pdPos)
+    qTrend := (sDir == 1 and trendBull) or (sDir == -1 and trendBear) ? 10 : 0
+    qMtf   := (sDir == 1 and htfBull) or (sDir == -1 and htfBear) ? 10 : 0
+    qRvol  := not na(rvol) and rvol >= rvolMin ? 10 : 0
+    qVwap  := (sDir == 1 and close > vwapLine) or (sDir == -1 and close < vwapLine) ? 10 : 0
+int qScore = score + qTrend + qMtf + qRvol + qVwap  // max 140 — heuristic confluence count, NOT a win probability
+string scoreParts = "Struct " + str.tostring(cStruct) + " · Range " + str.tostring(cRange) + " · Zone " + str.tostring(cZone) + " · FVG " + str.tostring(cFvg) + " · Sweep " + str.tostring(cSweep) + " · Trend " + str.tostring(qTrend) + " · HTF " + str.tostring(qMtf) + " · RVOL " + str.tostring(qRvol) + " · VWAP " + str.tostring(qVwap)
+
+// ════════════════════════════════════════════════════════════════
+//  ORDER BLOCK LIFE CYCLE + ZONE TAP SIGNALS
+// ════════════════════════════════════════════════════════════════
+if obBoxes.size() > 0
+    for i = obBoxes.size() - 1 to 0
+        st = obState.get(i)
+        ob = obBoxes.get(i)
+        od = obDir.get(i)
+        box.set_right(ob, bar_index + 2)
+        bool killed = false
+        if barstate.isconfirmed
+            if od == 1
+                if close < box.get_bottom(ob)
+                    killed := true
+                else if st == 0 and low <= box.get_top(ob)
+                    box.set_bgcolor(ob, color.new(bullCol, 62))
+                    obState.set(i, 1)
+                    if showSigs and filtBullOk and sDir == 1 and iDir == 1 and pdPos < 0.5
+                        evTapBull := true
+                        sgLabels.push(label.new(bar_index, low, "▲ Demand Tap · Score " + str.tostring(score), style = label.style_label_up, color = color.new(score >= 80 ? goldCol : bullCol, 10), textcolor = #06222b, size = size.small))
+                        // create setup only when IDLE (one active setup max)
+                        if suState == 0
+                            float slB = box.get_bottom(ob) - atr * atrBuffer
+                            float rB  = close - slB
+                            bool validB = rB > 0 and (maxRiskAtr == 0 or rB <= atr * maxRiskAtr) and not na(atr) and atr > 0
+                            if validB
+                                suState := 1
+                                suDir   := 1
+                                suId    += 1
+                                suBar   := bar_index
+                                suEntry := close
+                                suSL    := slB
+                                suRisk  := rB
+                                suTP1   := close + rB * tp1R
+                                suTP2   := close + rB * tp2R
+                                suTp1Hit := false
+                                suStatus := "ACTIVE LONG"
+                                evSetupLong := true
+                                evLevels    := true
+            else
+                if close > box.get_top(ob)
+                    killed := true
+                else if st == 0 and high >= box.get_bottom(ob)
+                    box.set_bgcolor(ob, color.new(bearCol, 62))
+                    obState.set(i, 1)
+                    if showSigs and filtBearOk and sDir == -1 and iDir == -1 and pdPos > 0.5
+                        evTapBear := true
+                        sgLabels.push(label.new(bar_index, high, "▼ Supply Tap · Score " + str.tostring(score), style = label.style_label_down, color = color.new(score >= 80 ? goldCol : bearCol, 10), textcolor = #2b0612, size = size.small))
+                        if suState == 0
+                            float slS = box.get_top(ob) + atr * atrBuffer
+                            float rS  = slS - close
+                            bool validS = rS > 0 and (maxRiskAtr == 0 or rS <= atr * maxRiskAtr) and not na(atr) and atr > 0
+                            if validS
+                                suState := 1
+                                suDir   := -1
+                                suId    += 1
+                                suBar   := bar_index
+                                suEntry := close
+                                suSL    := slS
+                                suRisk  := rS
+                                suTP1   := close - rS * tp1R
+                                suTP2   := close - rS * tp2R
+                                suTp1Hit := false
+                                suStatus := "ACTIVE SHORT"
+                                evSetupShort := true
+                                evLevels     := true
+        if killed
+            box.delete(ob)
+            obBoxes.remove(i)
+            obDir.remove(i)
+            obState.remove(i)
+
+// ════════════════════════════════════════════════════════════════
+//  SETUP LIFECYCLE (confirmed bars, bars AFTER the creation bar)
+//  Order per bar is deliberately conservative: SL/invalidation is
+//  evaluated before TP because OHLC cannot reveal intrabar order.
+//  Invalidation = bar trades at/beyond SL, OR confirmed close beyond
+//  SL, OR opposing swing BOS/CHoCH. Levels never move once frozen.
+// ════════════════════════════════════════════════════════════════
+if suState == 1 and barstate.isconfirmed and bar_index > suBar
+    bool flip = suDir == 1 ? (evBosBear or evChochBear) : (evBosBull or evChochBull)
+    bool slHit = suDir == 1 ? low <= suSL : high >= suSL
+    bool tp2Hit = suDir == 1 ? high >= suTP2 : low <= suTP2
+    bool tp1Hit = suDir == 1 ? high >= suTP1 : low <= suTP1
+    if slHit or flip
+        evInvalid := true
+        suStatus  := flip and not slHit ? "INVALIDATED (structure) #" + str.tostring(suId) : "INVALIDATED (SL) #" + str.tostring(suId)
+        suState   := 0
+    else if tp2Hit
+        evTp1     := not suTp1Hit
+        suTp1Hit  := true
+        evComplete := true
+        suStatus  := "COMPLETED TP2 #" + str.tostring(suId)
+        suState   := 0
+    else
+        if tp1Hit and not suTp1Hit
+            suTp1Hit := true
+            evTp1    := true
+            suStatus := "ACTIVE · TP1 HIT #" + str.tostring(suId)
+        if bar_index - suBar >= setupExpiry
+            evExpired := true
+            suStatus  := "EXPIRED #" + str.tostring(suId)
+            suState   := 0
+
+// frozen risk-level drawings: created once per setup, extended
+// only while ACTIVE, left frozen (not deleted) when it terminates
+if evLevels and showRisk
+    while rkLines.size() > 0
+        line.delete(rkLines.shift())
+    while rkLabels.size() > 0
+        label.delete(rkLabels.shift())
+    color dirC = suDir == 1 ? bullCol : bearCol
+    rkLines.push(line.new(suBar, suEntry, bar_index + 20, suEntry, color = color.new(silvCol, 20), style = line.style_dotted))
+    rkLines.push(line.new(suBar, suSL, bar_index + 20, suSL, color = color.new(bearCol, 0), style = line.style_dashed))
+    rkLines.push(line.new(suBar, suTP1, bar_index + 20, suTP1, color = color.new(bullCol, 20), style = line.style_dashed))
+    rkLines.push(line.new(suBar, suTP2, bar_index + 20, suTP2, color = color.new(bullCol, 0), style = line.style_dashed))
+    if showSetupLbl
+        string px = "MQE #" + str.tostring(suId) + " "
+        rkLabels.push(label.new(bar_index + 20, suEntry, px + "ENTRY " + str.tostring(suEntry, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(silvCol, 0), size = size.tiny))
+        rkLabels.push(label.new(bar_index + 20, suSL, px + "SL/INVALID " + str.tostring(suSL, format.mintick), style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(bearCol, 0), size = size.tiny))
+        rkLabels.push(label.new(bar_index + 20, suTP1, px + "TP1 " + str.tostring(suTP1, format.mintick) + " (" + str.tostring(tp1R, "#.#") + "R)", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(bullCol, 0), size = size.tiny))
+        rkLabels.push(label.new(bar_index + 20, suTP2, px + "TP2 " + str.tostring(suTP2, format.mintick) + " (" + str.tostring(tp2R, "#.#") + "R)", style = label.style_label_left, color = color.new(color.black, 100), textcolor = color.new(dirC, 0), size = size.tiny))
+if suState == 1 and rkLines.size() == 4
+    for i = 0 to 3
+        line.set_x2(rkLines.get(i), bar_index + 20)
+    if rkLabels.size() == 4
+        for i = 0 to 3
+            label.set_x(rkLabels.get(i), bar_index + 20)
+
+// derived dashboard values
+string biasTxt = sDir == 1 and (trendBull or htfBull) ? "BULLISH" : sDir == -1 and (trendBear or htfBear) ? "BEARISH" : sDir == 1 ? "BULLISH (weak)" : sDir == -1 ? "BEARISH (weak)" : "NEUTRAL"
+string setupTxt = suState == 1 ? (suDir == 1 ? "POTENTIAL LONG" : "POTENTIAL SHORT") : suStatus
+float rr1 = not na(suRisk) and suRisk > 0 ? math.abs(suTP1 - suEntry) / suRisk : na
+float rr2 = not na(suRisk) and suRisk > 0 ? math.abs(suTP2 - suEntry) / suRisk : na
+
+// ════════════════════════════════════════════════════════════════
+//  DRAWING MEMORY CAPS
+// ════════════════════════════════════════════════════════════════
+while stLines.size() > keepStruct
+    line.delete(stLines.shift())
+while stLabels.size() > keepStruct
+    label.delete(stLabels.shift())
+while inLabels.size() > keepStruct
+    label.delete(inLabels.shift())
+while obBoxes.size() > keepOB
+    box.delete(obBoxes.shift())
+    obDir.shift()
+    obState.shift()
+while fvgBoxes.size() > keepFvg
+    box.delete(fvgBoxes.shift())
+    fvgDir.shift()
+    fvgState.shift()
+while lqLines.size() > keepLiq
+    line.delete(lqLines.shift())
+    label.delete(lqLabels.shift())
+    lqPrice.shift()
+    lqDir.shift()
+    lqActive.shift()
+while sgLabels.size() > keepSigs
+    label.delete(sgLabels.shift())
+while rkLines.size() > keepRisk * 4
+    line.delete(rkLines.shift())
+while rkLabels.size() > keepRisk * 3
+    label.delete(rkLabels.shift())
+
+// ════════════════════════════════════════════════════════════════
+//  NARRATIVE
+// ════════════════════════════════════════════════════════════════
+string narr = "Ranging\nawaiting structure"
+if sDir == 1
+    narr := "Bullish structure"
+    narr += bar_index - lastSellSweepBar <= 30 ? "\nsell-side taken" : ""
+    narr += not na(pdPos) ? (pdPos < 0.5 ? "\nprice in discount" : "\nin premium, patience") : ""
+    narr += demandFreshNear ? "\ndemand below" : ""
+else if sDir == -1
+    narr := "Bearish structure"
+    narr += bar_index - lastBuySweepBar <= 30 ? "\nbuy-side taken" : ""
+    narr += not na(pdPos) ? (pdPos > 0.5 ? "\nprice in premium" : "\nin discount, patience") : ""
+    narr += supplyFreshNear ? "\nsupply above" : ""
+
+// ════════════════════════════════════════════════════════════════
+//  PREMIUM DASHBOARD
+// ════════════════════════════════════════════════════════════════
+dPos = dashPos == "Top Left" ? position.top_left : dashPos == "Bottom Right" ? position.bottom_right : dashPos == "Bottom Left" ? position.bottom_left : position.top_right
+bodySize = dashSize == "Tiny" ? size.tiny : dashSize == "Normal" ? size.normal : dashSize == "Large" ? size.large : size.small
+headSize = dashSize == "Tiny" ? size.small : dashSize == "Large" ? size.large : dashSize == "Normal" ? size.normal : size.small
+narrSize = dashSize == "Large" ? size.normal : dashSize == "Normal" ? size.small : size.tiny
+
+var table tb = table.new(dPos, 2, 24, bgcolor = dashBg, frame_color = dashFrame, frame_width = 1, border_color = dashGrid, border_width = 1)
+
+if showDash and barstate.islast
+    int freshD = 0
+    int freshS = 0
+    if obBoxes.size() > 0
+        for i = 0 to obBoxes.size() - 1
+            if obState.get(i) != 2
+                if obDir.get(i) == 1
+                    freshD += 1
+                else
+                    freshS += 1
+    int freshG = 0
+    if fvgBoxes.size() > 0
+        for i = 0 to fvgBoxes.size() - 1
+            if fvgState.get(i) != 2
+                freshG += 1
+    table.cell(tb, 0, 0, "◈ MONSSIF QUANT EDGE", bgcolor = dashTitleBg, text_color = dashHeadTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 0, f_rep("◆", math.min(5, score / 20)), bgcolor = dashTitleBg, text_color = dashHeadTxt, text_size = bodySize)
+    table.cell(tb, 0, 1, "Swing", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 1, sDir == 1 ? "Bullish" : sDir == -1 ? "Bearish" : "Forming", text_color = sDir == 1 ? bullCol : sDir == -1 ? bearCol : dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 2, "Internal", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 2, iDir == 1 ? "Bullish" : iDir == -1 ? "Bearish" : "Forming", text_color = iDir == 1 ? bullCol : iDir == -1 ? bearCol : dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 3, "Event", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 3, lastEvent, text_color = dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 4, "Range", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 4, na(pdPos) ? "—" : (pdPos < 0.5 ? "Discount · " : "Premium · ") + str.tostring(pdPos * 100, "#") + " %", text_color = na(pdPos) ? dashBodyTxt : pdPos < 0.5 ? bullCol : bearCol, text_size = bodySize)
+    table.cell(tb, 0, 5, "Liquidity", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 5, liqStatus, text_color = liqStatus == "Resting" ? dashBodyTxt : goldCol, text_size = bodySize)
+    table.cell(tb, 0, 6, "Zones", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 6, str.tostring(freshD) + " / " + str.tostring(freshS), text_color = dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 7, "Imbalances", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 7, str.tostring(freshG), text_color = dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 8, "Score", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 8, str.tostring(score) + "  " + f_rep("▮", math.min(5, score / 20)), text_color = score >= 80 ? goldCol : score >= 50 ? dashBodyTxt : dashMuteTxt, text_size = bodySize)
+    table.cell(tb, 0, 9, showNarr ? "Narrative" : "", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 9, showNarr ? narr : "", text_color = dashBodyTxt, text_size = narrSize, text_halign = text.align_left)
+    table.cell(tb, 0, 10, "VWAP", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 10, na(vwapLine) ? "—" : close > vwapLine ? "Above" : "Below", text_color = na(vwapLine) ? dashBodyTxt : close > vwapLine ? bullCol : bearCol, text_size = bodySize)
+    table.cell(tb, 0, 11, "Regime", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 11, regime + " · ADX " + str.tostring(adxVal, "#"), text_color = dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 12, "RVOL / RSI", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 12, (na(rvol) ? "—" : str.tostring(rvol, "#.0") + "×") + " / " + str.tostring(rsiVal, "#"), text_color = dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 13, "HTF (" + htfTf + ")", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 13, not showMtf ? "—" : htfBull ? "Bullish" : htfBear ? "Bearish" : "Neutral", text_color = htfBull ? bullCol : htfBear ? bearCol : dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 14, "Quality", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 14, str.tostring(qScore) + " / 140", text_color = qScore >= 110 ? goldCol : dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 15, "Market Bias", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 15, biasTxt, text_color = str.contains(biasTxt, "BULLISH") ? bullCol : str.contains(biasTxt, "BEARISH") ? bearCol : dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 16, "Setup", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 16, setupTxt, text_color = suState == 1 ? (suDir == 1 ? bullCol : bearCol) : dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 17, "State / ID", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 17, suStatus + (suState == 1 ? " · bar " + str.tostring(bar_index - suBar) + "/" + str.tostring(setupExpiry) : ""), text_color = dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 18, "Ref Entry", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 18, na(suEntry) ? "—" : str.tostring(suEntry, format.mintick), text_color = dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 19, "SL / Invalidation", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 19, na(suSL) ? "—" : str.tostring(suSL, format.mintick), text_color = na(suSL) ? dashBodyTxt : bearCol, text_size = bodySize)
+    table.cell(tb, 0, 20, "TP1 / TP2", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 20, na(suTP1) ? "—" : str.tostring(suTP1, format.mintick) + " / " + str.tostring(suTP2, format.mintick), text_color = na(suTP1) ? dashBodyTxt : bullCol, text_size = bodySize)
+    table.cell(tb, 0, 21, "Risk · RR", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 21, na(suRisk) ? "—" : str.tostring(suRisk, format.mintick) + " (" + str.tostring(not na(atr) and atr > 0 ? suRisk / atr : na, "#.0") + " ATR) · " + str.tostring(rr1, "#.0") + "R/" + str.tostring(rr2, "#.0") + "R", text_color = dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 22, "BOS/CHoCH", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 22, lastEvent + " · RSI " + str.tostring(rsiVal, "#") + " · " + regime, text_color = dashBodyTxt, text_size = bodySize)
+    table.cell(tb, 0, 23, "Score Parts", text_color = dashMuteTxt, text_size = headSize, text_halign = text.align_left)
+    table.cell(tb, 1, 23, scoreParts, text_color = dashMuteTxt, text_size = narrSize, text_halign = text.align_left)
+
+
+// ════════════════════════════════════════════════════════════════
+//  STRATEGY EXECUTION (simulated only — no live orders)
+//  Entries fire on the confirmed setup-creation bar close
+//  (process_orders_on_close). Exits use the SAME frozen levels as
+//  the indicator. One position max (pyramiding=0 + position guard).
+// ════════════════════════════════════════════════════════════════
+if evSetupLong and stLong and strategy.position_size == 0
+    float qtyL = not na(suRisk) and suRisk > 0 and syminfo.pointvalue > 0 ? strategy.equity * stRiskPct / 100 / suRisk / syminfo.pointvalue : na
+    if not na(qtyL) and qtyL > 0
+        strategy.entry("MQE Long", strategy.long, qty = qtyL, comment = "MQE #" + str.tostring(suId))
+        strategy.exit("Long TP1", from_entry = "MQE Long", limit = suTP1, qty_percent = stTp1Qty)
+        strategy.exit("Long TP2/SL", from_entry = "MQE Long", limit = suTP2, stop = suSL)
+if evSetupShort and stShort and strategy.position_size == 0
+    float qtyS = not na(suRisk) and suRisk > 0 and syminfo.pointvalue > 0 ? strategy.equity * stRiskPct / 100 / suRisk / syminfo.pointvalue : na
+    if not na(qtyS) and qtyS > 0
+        strategy.entry("MQE Short", strategy.short, qty = qtyS, comment = "MQE #" + str.tostring(suId))
+        strategy.exit("Short TP1", from_entry = "MQE Short", limit = suTP1, qty_percent = stTp1Qty)
+        strategy.exit("Short TP2/SL", from_entry = "MQE Short", limit = suTP2, stop = suSL)
+if (evInvalid or evExpired) and strategy.position_size != 0
+    strategy.close_all(comment = "MQE setup ended")
+
+// Strategy Tester shows full stats; these expose key figures in Data Window.
+// Max drawdown / profit factor are read from TradingView's Strategy Tester
+// report (strategy.max_drawdown is also available as a series in Pine v6).
+plot(strategy.netprofit, "Backtest Net Profit (account ccy)", display = display.data_window)
+plot(strategy.wintrades, "Backtest Winning Trades", display = display.data_window)
+plot(strategy.losstrades, "Backtest Losing Trades", display = display.data_window)
+plot(strategy.closedtrades, "Backtest Total Closed Trades", display = display.data_window)
+plot(strategy.grossloss != 0 ? -strategy.grossprofit / strategy.grossloss : na, "Backtest Profit Factor", display = display.data_window)
+plot(strategy.max_drawdown, "Backtest Max Drawdown (account ccy)", display = display.data_window)
+plot(strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100 : na, "Backtest Win Rate % (historical only)", display = display.data_window)
+
+// ════════════════════════════════════════════════════════════════
+//  ALERTS
+// ════════════════════════════════════════════════════════════════
+alertcondition(evBosBull, "Bullish Break of Structure", "Price closed above the swing high — bullish break of structure.")
+alertcondition(evBosBear, "Bearish Break of Structure", "Price closed below the swing low — bearish break of structure.")
+alertcondition(evChochBull, "Bullish Change of Character", "Structure shifted from bearish to bullish.")
+alertcondition(evChochBear, "Bearish Change of Character", "Structure shifted from bullish to bearish.")
+alertcondition(evSweepBuy, "Buy-Side Liquidity Sweep", "Buy-side liquidity was swept and rejected.")
+alertcondition(evSweepSell, "Sell-Side Liquidity Sweep", "Sell-side liquidity was swept and rejected.")
+alertcondition(evTapBull, "Demand Zone Tap", "Price tapped a fresh demand zone with aligned structure in discount.")
+alertcondition(evTapBear, "Supply Zone Tap", "Price tapped a fresh supply zone with aligned structure in premium.")
+alertcondition(evInvFvg, "Fair Value Gap Inversion", "A fair value gap was violated and flipped into an inversion zone.")
+alertcondition(evTapBull and qScore >= 110, "High-Quality Demand Tap (Q>=110)", "Demand tap with extended quality score at or above 110/140. Context only — not a guarantee of outcome.")
+alertcondition(evTapBear and qScore >= 110, "High-Quality Supply Tap (Q>=110)", "Supply tap with extended quality score at or above 110/140. Context only — not a guarantee of outcome.")
+// hoisted: ta.crossover/crossunder must execute on every bar (CW10002)
+vwapCrossUp = ta.crossover(close, vwapLine)
+vwapCrossDn = ta.crossunder(close, vwapLine)
+alertcondition(barstate.isconfirmed and vwapCrossUp, "Close Crosses Above VWAP", "Confirmed close crossed above session VWAP.")
+alertcondition(barstate.isconfirmed and vwapCrossDn, "Close Crosses Below VWAP", "Confirmed close crossed below session VWAP.")
+// ── Setup state-machine alerts (each fires once per setup/event) ──
+alertcondition(evSetupLong, "Potential Bullish Setup", "MQE: POTENTIAL LONG setup created on {{ticker}} ({{interval}}). See chart/dashboard for frozen reference entry, SL, TP1, TP2 and setup ID. Analytical output only — not financial advice, no guaranteed outcome.")
+alertcondition(evSetupShort, "Potential Bearish Setup", "MQE: POTENTIAL SHORT setup created on {{ticker}} ({{interval}}). See chart/dashboard for frozen reference entry, SL, TP1, TP2 and setup ID. Analytical output only — not financial advice, no guaranteed outcome.")
+alertcondition(evLevels, "Risk Levels Available", "MQE: reference entry and calculated SL/TP1/TP2 are now frozen for the new setup on {{ticker}} ({{interval}}). Levels are calculations, not guaranteed execution prices.")
+alertcondition(evInvalid, "Setup Invalidated", "MQE: active setup invalidated (SL touched or opposing structure) on {{ticker}} ({{interval}}).")
+alertcondition(evTp1, "Setup TP1 Reached", "MQE: active setup reached TP1 on {{ticker}} ({{interval}}). Simulated/analytical only.")
+alertcondition(evComplete, "Setup Completed (TP2)", "MQE: active setup reached TP2 and is completed in the simulation on {{ticker}} ({{interval}}).")
+alertcondition(evExpired, "Setup Expired", "MQE: active setup expired without completion on {{ticker}} ({{interval}}).")
+
+// dynamic detailed alerts — in TradingView choose "alert() function calls only"
+// when creating the alert to receive symbol/TF/direction/all frozen levels/ID.
+if evLevels
+    alert("MQE SETUP #" + str.tostring(suId) + " · " + syminfo.ticker + " · TF " + timeframe.period + " · " + (suDir == 1 ? "POTENTIAL LONG" : "POTENTIAL SHORT") + "\nRef Entry: " + str.tostring(suEntry, format.mintick) + "\nSL/Invalidate: " + str.tostring(suSL, format.mintick) + "\nTP1: " + str.tostring(suTP1, format.mintick) + "  TP2: " + str.tostring(suTP2, format.mintick) + "\nRisk: " + str.tostring(suRisk, format.mintick) + " · Quality: " + str.tostring(qScore) + "/140 (heuristic, not a win probability)\nAnalytical output only — not financial advice.", alert.freq_once_per_bar_close)
+if evInvalid
+    alert("MQE INVALIDATED #" + str.tostring(suId) + " · " + syminfo.ticker + " · TF " + timeframe.period + " · " + suStatus, alert.freq_once_per_bar_close)
+if evComplete
+    alert("MQE COMPLETED TP2 #" + str.tostring(suId) + " · " + syminfo.ticker + " · TF " + timeframe.period, alert.freq_once_per_bar_close)
