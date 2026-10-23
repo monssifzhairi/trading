@@ -155,3 +155,23 @@ and any broker-emulator differences. ⚠️ Alert delivery (both mechanisms).
 - Alerts: 7 new one-shot conditions + dynamic detailed `alert()` messages.
 - New separate strategy file for backtesting/simulation (commission &
   slippage modelled, risk-based sizing, Data-Window performance plots).
+
+---
+
+## 9. Patch v2.0.1 — TradingView compile feedback (2026-10-23)
+
+Fixed exactly the error/warnings reported by the Pine Editor (thanks — this
+was the first real compile, as flagged in §7):
+
+| Report | Cause | Fix |
+|---|---|---|
+| `CE10272 Undeclared identifier "strategy.lostrades"` (strategy file) | Typo: built-in is **`strategy.losstrades`** ("loss"+"trades") | Corrected (strategy file only). Verified against the Pine v6 reference / TradingView docs listing `strategy.wintrades, strategy.losstrades` |
+| `SHORT_TITLE_TOO_LONG` (strategy) | Short title `"MQE Strategy"` = 12 chars > 10 | Renamed to `"MQE Strat"` (9). Indicator `"MQE v2"` (6) unaffected |
+| `CW10003` ×2 — `f_makeOB` called in conditional scope | It was called only inside the bullish/bearish break branches | Signature is now `f_makeOB(bull_, create_)`: the origin scan runs via **unconditional global calls every bar**, a zone is created only when the confirmed-break event flag (`evBos*/evChoch*`) is true. Zone-creation timing and order are unchanged |
+| `CW10002` ×2 — `ta.crossover/crossunder` inside conditional expression | They were inlined in `alertcondition(barstate.isconfirmed and ta.crossover(...))` | Hoisted to unconditional globals `vwapCrossUp` / `vwapCrossDn`; conditions now reference those series |
+
+Applied identically to both files (except the two strategy-only items).
+Side effect to know: `f_findOrigin`'s ≤30-bar lookback loop now executes
+every bar even when no zone is created — negligible cost, and it is the
+pattern TradingView recommends. Recompile in the Pine Editor to confirm the
+warning list is now empty; report any remaining items the same way.

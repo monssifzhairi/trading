@@ -9,7 +9,7 @@
 // only — no live execution. This indicator is a technical-analysis aid.
 // It does not guarantee profitable trades; the quality score is a heuristic
 // confluence count, NOT a win probability. Backtest + paper-trade first.
-strategy("MONSSIF QUANT EDGE v2 — Strategy (Backtest/Simulation)", "MQE Strategy", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500, initial_capital = 10000, pyramiding = 0, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 2, process_orders_on_close = true)
+strategy("MONSSIF QUANT EDGE v2 — Strategy (Backtest/Simulation)", "MQE Strat", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500, max_bars_back = 500, initial_capital = 10000, pyramiding = 0, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 2, process_orders_on_close = true)
 
 // ════════════════════════════════════════════════════════════════
 //  Concept credits: smart money terminology (order blocks, fair
@@ -223,9 +223,12 @@ f_findOrigin(bool bull_) =>
             break
     idx
 
-f_makeOB(bool bull_) =>
+// Called UNCONDITIONALLY every bar (CW10003): the origin scan always
+// runs; a zone is only created when `create_` is true (a confirmed
+// swing BOS/CHoCH fired this bar). Behaviour is unchanged.
+f_makeOB(bool bull_, bool create_) =>
     idx = f_findOrigin(bull_)
-    if showOB and not na(idx)
+    if create_ and showOB and not na(idx)
         obT = high[idx]
         obB = low[idx]
         rv  = na(volume[idx]) or na(volSma[idx]) or volSma[idx] == 0 ? na : volume[idx] / volSma[idx]
@@ -292,7 +295,6 @@ if barstate.isconfirmed
         if showSwing
             stLines.push(line.new(swingHighBar, swingHigh, bar_index, swingHigh, color = color.new(bullCol, 0), width = 2, style = isCh ? line.style_dashed : line.style_solid))
             stLabels.push(label.new(int(math.avg(swingHighBar, bar_index)), swingHigh, isCh ? "CHoCH" : "BoS", style = label.style_label_down, color = color.new(color.black, 100), textcolor = color.new(bullCol, 0), size = size.small))
-        f_makeOB(true)
         sDir := 1
         swingHighBroken := true
     // swing bearish break
@@ -307,7 +309,6 @@ if barstate.isconfirmed
         if showSwing
             stLines.push(line.new(swingLowBar, swingLow, bar_index, swingLow, color = color.new(bearCol, 0), width = 2, style = isCh ? line.style_dashed : line.style_solid))
             stLabels.push(label.new(int(math.avg(swingLowBar, bar_index)), swingLow, isCh ? "CHoCH" : "BoS", style = label.style_label_up, color = color.new(color.black, 100), textcolor = color.new(bearCol, 0), size = size.small))
-        f_makeOB(false)
         sDir := -1
         swingLowBroken := true
     // internal breaks (context tier)
@@ -338,6 +339,12 @@ if barstate.isconfirmed
         liqStatus := "Sell swept"
         if showLiq
             sgLabels.push(label.new(bar_index, low, "Liquidity Sweep ✕", style = label.style_label_up, color = color.new(bullCol, 5), textcolor = color.new(#ffffff, 0), size = size.small))
+
+// order-block creation: unconditional call every bar (CW10003).
+// evBos*/evChoch* are only true on confirmed break bars, so zones
+// are created exactly when (and only when) v1 created them.
+f_makeOB(true,  evBosBull or evChochBull)
+f_makeOB(false, evBosBear or evChochBear)
 
 // ════════════════════════════════════════════════════════════════
 //  EQUAL LEVEL LIFE CYCLE
@@ -823,7 +830,7 @@ if (evInvalid or evExpired) and strategy.position_size != 0
 // report (strategy.max_drawdown is also available as a series in Pine v6).
 plot(strategy.netprofit, "Backtest Net Profit (account ccy)", display = display.data_window)
 plot(strategy.wintrades, "Backtest Winning Trades", display = display.data_window)
-plot(strategy.lostrades, "Backtest Losing Trades", display = display.data_window)
+plot(strategy.losstrades, "Backtest Losing Trades", display = display.data_window)
 plot(strategy.closedtrades, "Backtest Total Closed Trades", display = display.data_window)
 plot(strategy.grossloss != 0 ? -strategy.grossprofit / strategy.grossloss : na, "Backtest Profit Factor", display = display.data_window)
 plot(strategy.max_drawdown, "Backtest Max Drawdown (account ccy)", display = display.data_window)
@@ -843,8 +850,11 @@ alertcondition(evTapBear, "Supply Zone Tap", "Price tapped a fresh supply zone w
 alertcondition(evInvFvg, "Fair Value Gap Inversion", "A fair value gap was violated and flipped into an inversion zone.")
 alertcondition(evTapBull and qScore >= 110, "High-Quality Demand Tap (Q>=110)", "Demand tap with extended quality score at or above 110/140. Context only — not a guarantee of outcome.")
 alertcondition(evTapBear and qScore >= 110, "High-Quality Supply Tap (Q>=110)", "Supply tap with extended quality score at or above 110/140. Context only — not a guarantee of outcome.")
-alertcondition(barstate.isconfirmed and ta.crossover(close, vwapLine), "Close Crosses Above VWAP", "Confirmed close crossed above session VWAP.")
-alertcondition(barstate.isconfirmed and ta.crossunder(close, vwapLine), "Close Crosses Below VWAP", "Confirmed close crossed below session VWAP.")
+// hoisted: ta.crossover/crossunder must execute on every bar (CW10002)
+vwapCrossUp = ta.crossover(close, vwapLine)
+vwapCrossDn = ta.crossunder(close, vwapLine)
+alertcondition(barstate.isconfirmed and vwapCrossUp, "Close Crosses Above VWAP", "Confirmed close crossed above session VWAP.")
+alertcondition(barstate.isconfirmed and vwapCrossDn, "Close Crosses Below VWAP", "Confirmed close crossed below session VWAP.")
 // ── Setup state-machine alerts (each fires once per setup/event) ──
 alertcondition(evSetupLong, "Potential Bullish Setup", "MQE: POTENTIAL LONG setup created on {{ticker}} ({{interval}}). See chart/dashboard for frozen reference entry, SL, TP1, TP2 and setup ID. Analytical output only — not financial advice, no guaranteed outcome.")
 alertcondition(evSetupShort, "Potential Bearish Setup", "MQE: POTENTIAL SHORT setup created on {{ticker}} ({{interval}}). See chart/dashboard for frozen reference entry, SL, TP1, TP2 and setup ID. Analytical output only — not financial advice, no guaranteed outcome.")
