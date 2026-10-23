@@ -1,0 +1,29 @@
+//@version=6
+// Pocket Pivot Volume (PPV) — marks up-days whose volume exceeds the highest
+// down-day volume of the past N sessions, i.e. an institutional-buying footprint.
+indicator("Pocket Pivot Volume", "PPV", overlay = true)
+
+lookback   = input.int(10, "Down-day lookback", minval = 5, maxval = 30)
+useMaFilt  = input.bool(true, "Require price above moving average")
+maLen      = input.int(50, "Moving average length", minval = 5)
+useTrendUp = input.bool(true, "Require MA rising")
+
+ma = ta.sma(close, maLen)
+
+// highest volume among down days in the last `lookback` bars (excluding today)
+float maxDownVol = 0.0
+for i = 1 to lookback
+    if close[i] < close[i + 1]
+        maxDownVol := math.max(maxDownVol, volume[i])
+
+bool upDay   = close > close[1]
+bool volOk   = volume > maxDownVol
+bool maOk    = not useMaFilt or close > ma
+bool trendOk = not useTrendUp or ma > ma[1]
+
+bool ppv = upDay and volOk and maOk and trendOk
+
+plotshape(ppv, "Pocket Pivot", shape.circle, location.belowbar, color.new(color.blue, 0), size = size.small)
+plot(useMaFilt ? ma : na, "MA", color.new(color.gray, 40))
+
+alertcondition(ppv, "Pocket Pivot", "Pocket pivot volume signal on {{ticker}}")

@@ -1,0 +1,69 @@
+//@version=5
+indicator("Market Structure — BOS / CHoCH", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ─────────────────────────────────────────────
+// ورودی‌ها (Inputs)
+// ─────────────────────────────────────────────
+length   = input.int(5,  "طول سوئینگ (Swing / Pivot)", minval=1)
+showBreak= input.bool(true, "نمایش خط سطح شکسته‌شده")
+
+// ─────────────────────────────────────────────
+// پیوت‌ها
+// ─────────────────────────────────────────────
+ph = ta.pivothigh(high, length, length)
+pl = ta.pivotlow(low,  length, length)
+
+var float lastHigh    = na
+var int   lastHighBar = na
+var float lastLow     = na
+var int   lastLowBar  = na
+var int   trend       = 0    // 1 = صعودی , -1 = نزولی
+
+if not na(ph)
+    lastHigh    := ph
+    lastHighBar := bar_index - length
+if not na(pl)
+    lastLow    := pl
+    lastLowBar := bar_index - length
+
+// ─────────────────────────────────────────────
+// شکست ساختار
+// close از آخرین سقف عبور کند → شکست صعودی
+// close از آخرین کف عبور کند  → شکست نزولی
+// ─────────────────────────────────────────────
+bullBreak = not na(lastHigh) and close > lastHigh and close[1] <= lastHigh
+bearBreak = not na(lastLow)  and close < lastLow  and close[1] >= lastLow
+
+// ─────────────────────────────────────────────
+// شکست صعودی: اگر روند نزولی بود → CHoCH ، وگرنه → BOS
+// ─────────────────────────────────────────────
+if bullBreak
+    isChoch = trend == -1
+    txt   = isChoch ? "CHoCH" : "BOS"
+    col   = isChoch ? color.orange : color.green
+    label.new(bar_index, high, txt, style=label.style_label_down,
+         color=col, textcolor=color.white, size=size.small)
+    if showBreak
+        line.new(lastHighBar, lastHigh, bar_index, lastHigh,
+             color=col, width=1, style=line.style_dashed)
+    trend := 1
+
+// ─────────────────────────────────────────────
+// شکست نزولی: اگر روند صعودی بود → CHoCH ، وگرنه → BOS
+// ─────────────────────────────────────────────
+if bearBreak
+    isChoch = trend == 1
+    txt   = isChoch ? "CHoCH" : "BOS"
+    col   = isChoch ? color.orange : color.red
+    label.new(bar_index, low, txt, style=label.style_label_up,
+         color=col, textcolor=color.white, size=size.small)
+    if showBreak
+        line.new(lastLowBar, lastLow, bar_index, lastLow,
+             color=col, width=1, style=line.style_dashed)
+    trend := -1
+
+// ─────────────────────────────────────────────
+// هشدارها (Alerts)
+// ─────────────────────────────────────────────
+alertcondition(bullBreak, title="شکست ساختار صعودی", message="Bullish structure break (BOS/CHoCH)")
+alertcondition(bearBreak, title="شکست ساختار نزولی", message="Bearish structure break (BOS/CHoCH)")
